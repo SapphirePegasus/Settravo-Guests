@@ -1,16 +1,6 @@
 {
     "version": 2,
     "name": "settravo-guest",
-    "routes": [
-        {
-            "src": "/api/guest",
-            "dest": "/api/guest.js"
-        },
-        {
-            "src": "/(.*)",
-            "dest": "/public/index.html"
-        }
-    ],
     "headers": [
         {
             "source": "/api/(.*)",
@@ -61,6 +51,12 @@
                     "value": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://settravo.sapphirepegasus.com; img-src 'self' data:; font-src 'self';"
                 }
             ]
+        }
+    ],
+    "rewrites": [
+        {
+            "source": "/((?!api/).*)",
+            "destination": "/public/index.html"
         }
     ]
 }
