@@ -6,18 +6,29 @@
  * Validates the guest_token, fetches the member's trip + settlement data,
  * and returns it as JSON. The guest webpage calls this on load.
  *
- * Security:
+ * ── Phase-4 correctness fix ─────────────────────────────────────────────────
+ * computeBalance previously summed EVERY split — settled ones included — so a
+ * guest who had already paid their friend back still showed as owing. The
+ * balance now mirrors the app's settlement engine exactly:
+ *   - Only unsettled splits create pending debt.
+ *   - A split where the member IS the payer (self-share) never creates debt.
+ *   - Debt is pairwise; reciprocal debts between the same two people are
+ *     netted into one figure. Nothing else is merged.
+ *   - "You paid" / "Your share" remain gross totals across the whole trip
+ *     (informational stats, deliberately unchanged in meaning).
+ * Response stays backward compatible and adds `iSettled` (paise this member
+ * has already settled) so the page can reassure "you've paid ₹X already".
+ *
+ * Security (unchanged, plus two hardening headers):
  *  - SUPABASE_SERVICE_ROLE_KEY is a Vercel environment secret — never
- *    exposed to the browser. Set it in Vercel project settings under
- *    Settings → Environment Variables.
- *  - guest_token is a UUID v4 (2^122 entropy). Not guessable.
+ *    exposed to the browser.
+ *  - guest_token is a UUID v4 (2^122 entropy). Not guessable. Strict regex
+ *    validation before any DB round-trip.
  *  - Returns ONLY the requesting member's own balance data.
  *  - Rate limited: 30 requests per IP per minute (in-memory sliding window).
- *    Vercel's own infra handles DDoS above this layer.
- *  - CORS locked to your domain only. No wildcard.
- *  - UUID format is validated with a strict regex before touching the DB.
- *    This prevents SQL injection patterns and wastes no DB round-trips on
- *    obviously invalid tokens.
+ *  - CORS locked to the production domain. No wildcard.
+ *  - Cache-Control: no-store — private balance data must never be cached by
+ *    intermediaries; X-Robots-Tag: noindex keeps token URLs out of indexes.
  *
  * Runtime: Node.js 20.x (Vercel default)
  * No npm dependencies — uses the built-in fetch (Node 18+).
@@ -102,25 +113,33 @@ function makeSupabaseClient(supabaseUrl, serviceRoleKey) {
 }
 
 /**
- * Compute a simplified per-person net balance for `myMemberId`.
+ * Compute this member's balance using the SAME pairwise, settled-aware rules
+ * as the app's settlement engine (src/utils/settlement.ts):
  *
- * Returns:
- *  - iOweDetails: people this member owes money to
- *  - owedToMeDetails: people who owe this member money
- *  - iPaid: total paise this member paid across all expenses
- *  - iOwe: total paise this member owes across all splits
- *  - myNet: positive = others owe me, negative = I owe others
+ *  - Pending debt = unsettled splits only, self-shares excluded, netted
+ *    per pair of members.
+ *  - iPaid / iOwe = gross informational totals over the whole trip.
+ *  - iSettled = this member's shares already marked settled (paise).
+ *  - myNet = sum of pairwise nets (positive: others owe me).
  *
  * All arithmetic is integer paise — no floating point.
  *
+ * Exported for the test suite (scripts/guest-balance.spec.mjs).
+ *
  * @param {string} myMemberId
- * @param {any[]} expenses
- * @param {any[]} splits
+ * @param {{ id: string, paid_by_member: string, amount_money: number }[]} expenses
+ * @param {{ expense_id: string, member_id: string, share_money: number, is_settled: boolean }[]} splits
  * @param {Map<string, string>} memberNameMap  memberId → displayName
  */
-function computeBalance(myMemberId, expenses, splits, memberNameMap) {
+export function computeBalance(myMemberId, expenses, splits, memberNameMap) {
+    /** @type {Map<string, string>} expenseId → payer memberId */
+    const payerByExpense = new Map(
+        expenses.map((e) => [e.id, e.paid_by_member])
+    );
+
     let iPaid = 0;
     let iOwe = 0;
+    let iSettled = 0;
 
     for (const expense of expenses) {
         if (expense.paid_by_member === myMemberId) {
@@ -128,32 +147,36 @@ function computeBalance(myMemberId, expenses, splits, memberNameMap) {
         }
     }
 
-    for (const split of splits) {
-        if (split.member_id === myMemberId) {
-            iOwe += split.share_money;
-        }
-    }
-
-    const myNet = iPaid - iOwe;
-
-    /** @type {Map<string, number>} net amount with each other member */
+    /**
+     * Pairwise pending ledger involving me:
+     * net amount per other member — positive: they owe me.
+     * @type {Map<string, number>}
+     */
     const netWithMember = new Map();
 
-    for (const expense of expenses) {
-        const payer = expense.paid_by_member;
-        const expenseSplits = splits.filter((s) => s.expense_id === expense.id);
+    for (const split of splits) {
+        const payer = payerByExpense.get(split.expense_id);
+        if (!payer) continue; // orphaned split — skip defensively
 
-        for (const split of expenseSplits) {
-            const debtor = split.member_id;
-            if (debtor === payer) continue;
+        if (split.member_id === myMemberId) {
+            iOwe += split.share_money;
+            if (split.is_settled) iSettled += split.share_money;
+        }
 
-            if (debtor === myMemberId) {
-                const cur = netWithMember.get(payer) ?? 0;
-                netWithMember.set(payer, cur - split.share_money);
-            } else if (payer === myMemberId) {
-                const cur = netWithMember.get(debtor) ?? 0;
-                netWithMember.set(debtor, cur + split.share_money);
-            }
+        // Pending pairwise debt: unsettled, non-self, involving me.
+        if (split.is_settled) continue;
+        if (split.member_id === payer) continue;
+        if (split.share_money <= 0) continue;
+
+        if (split.member_id === myMemberId) {
+            // I owe the payer.
+            netWithMember.set(payer, (netWithMember.get(payer) ?? 0) - split.share_money);
+        } else if (payer === myMemberId) {
+            // The split member owes me.
+            netWithMember.set(
+                split.member_id,
+                (netWithMember.get(split.member_id) ?? 0) + split.share_money
+            );
         }
     }
 
@@ -161,17 +184,24 @@ function computeBalance(myMemberId, expenses, splits, memberNameMap) {
     const iOweDetails = [];
     /** @type {{ fromName: string; amount: number }[]} */
     const owedToMeDetails = [];
+    let myNet = 0;
 
     for (const [otherId, net] of netWithMember.entries()) {
-        const otherName = memberNameMap.get(otherId) ?? otherId;
+        if (net === 0) continue;
+        myNet += net;
+        const otherName = memberNameMap.get(otherId) ?? "A trip member";
         if (net < 0) {
-            iOweDetails.push({ toName: otherName, amount: Math.abs(net) });
-        } else if (net > 0) {
+            iOweDetails.push({ toName: otherName, amount: -net });
+        } else {
             owedToMeDetails.push({ fromName: otherName, amount: net });
         }
     }
 
-    return { iPaid, iOwe, myNet, iOweDetails, owedToMeDetails };
+    // Deterministic order: largest amounts first (stable UI).
+    iOweDetails.sort((a, b) => b.amount - a.amount);
+    owedToMeDetails.sort((a, b) => b.amount - a.amount);
+
+    return { iPaid, iOwe, iSettled, myNet, iOweDetails, owedToMeDetails };
 }
 
 /**
@@ -184,6 +214,9 @@ export default async function handler(req, res) {
     const origin = req.headers["origin"] ?? "";
 
     res.setHeader("Vary", "Origin");
+    // Private financial data: never cache anywhere, never index token URLs.
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Robots-Tag", "noindex, nofollow");
 
     if (req.method === "OPTIONS") {
         if (origin === ALLOWED_ORIGIN) {
@@ -294,6 +327,8 @@ export default async function handler(req, res) {
             memberName: member.display_name,
             tripName: trip?.name ?? "Trip",
             tripDestination: trip?.destination ?? null,
+            memberCount: allMembers.length,
+            expenseCount: expenses.length,
             ...balance,
         });
     } catch (err) {
